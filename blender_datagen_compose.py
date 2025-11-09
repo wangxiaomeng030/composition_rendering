@@ -76,13 +76,16 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
     for p in blender_passes:
         img_list = sorted(glob.glob(os.path.join(output_dir, f'{p}.*')))
         if p == 'normal' and len(img_list) > 0:
-            meta_file = json.load(open(os.path.join(output_dir, f'0000.meta.json')))
+            meta_files = sorted(glob.glob(os.path.join(output_dir, f'*.meta.json')))
+            if meta_files:
+                meta_file = json.load(open(meta_files[0]))
             meta_frames = meta_file['frames']
         for img_path in img_list:
             img_basename = os.path.basename(img_path)
             img_name_part = img_basename.split('.')
-            pidx, fidx, img_fmt = int(img_name_part[1]), int(img_name_part[2]) - 1, img_name_part[3]
-            img_new_name = f'{pidx:04d}.{fidx:04d}.{p}.{img_fmt}'
+            scene_i = int(img_name_part[1])
+            pidx, fidx, img_fmt = int(img_name_part[2]), int(img_name_part[3]) - 1, img_name_part[4]
+            img_new_name = f'{scene_i:04d}.{pidx:04d}.{fidx:04d}.{p}.{img_fmt}'
             if p == 'normal':
                 w_normal = image_utils.read_normal_exr(img_path)[..., :3] # [H, W, 3]
                 mask = (w_normal == 0).all(axis=-1, keepdims=True) # [H, W, 1]
@@ -92,7 +95,7 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
                 s_normal = w_normal @ w2c_rot.T
                 s_normal = s_normal * (1-mask) + mask * bg_normal
                 s_normal = (s_normal + 1) * 0.5
-                img_new_name = f'{pidx:04d}.{fidx:04d}.{p}.{feature_fmt}'
+                img_new_name = f'{scene_i:04d}.{pidx:04d}.{fidx:04d}.{p}.{feature_fmt}'
                 image_utils.save_image(os.path.join(output_dir, img_new_name), s_normal)
                 # remove the original normal
                 os.remove(img_path)
@@ -101,17 +104,23 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
                 iio.imwrite(os.path.join(output_dir, img_new_name), depth, plugin='opencv')
                 os.remove(img_path)
             elif p == 'albedo':
-                albedo = image_utils.read_img(img_path)
-                img_new_name = f'{pidx:04d}.{fidx:04d}.{p}.{feature_fmt}'
+                success, albedo = image_utils.read_img(img_path)
+                if not success:
+                    logger.warning(f"Failed to read albedo image: {img_path}")
+                    continue
+                img_new_name = f'{scene_i:04d}.{pidx:04d}.{fidx:04d}.{p}.{feature_fmt}'
                 # NOTE: albedo is in sRGB!!!
                 albedo = render_utils.rgb_to_srgb(albedo)
                 image_utils.save_image(os.path.join(output_dir, img_new_name), albedo)
                 os.remove(img_path)
             elif p == 'orm':
-                orm = image_utils.read_img(img_path)
+                success, orm = image_utils.read_img(img_path)
+                if not success:
+                    logger.warning(f"Failed to read ORM image: {img_path}")
+                    continue
                 roughness, metallic = orm[..., 1:2], orm[..., 2:3]
-                for key, value, bg_color in zip(['roughness', 'metallic'], [roughness, metallic], [0.5, 0]):
-                    img_new_name = f'{pidx:04d}.{fidx:04d}.{key}.{feature_fmt}'
+                for key, value, bg_color in zip(['roughness', 'metallic'], [roughness, metallic], [0.5, 0.0]):
+                    img_new_name = f'{scene_i:04d}.{pidx:04d}.{fidx:04d}.{key}.{feature_fmt}'
                     value = value * (1-mask) + mask * bg_color
                     image_utils.save_image(os.path.join(output_dir, img_new_name), value[..., 0])
                 os.remove(img_path)
@@ -119,32 +128,33 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
                 # os.rename(img_path, os.path.join(output_dir, img_new_name))
                 shutil.move(img_path, os.path.join(output_dir, img_new_name))
 
-    # Optionally dump videos from RGB frames grouped by lighting index
+    # Optionally dump videos from RGB frames grouped by scene and lighting index
     if dump_video:
         # Accept any extension for RGB frames (png/jpg)
         rgb_list = sorted(glob.glob(os.path.join(output_dir, f'*.rgb.*')))
-        # Group frames by lighting index (first token)
+        # Group frames by scene and lighting index
         group_dict = {}
         for fp in rgb_list:
             base = os.path.basename(fp)
             parts = base.split('.')
             if len(parts) < 4:
                 continue
-            pidx_str, fidx_str = parts[0], parts[1]
             try:
-                pidx = int(pidx_str)
-                fidx = int(fidx_str)
+                scene_i = int(parts[0])
+                pidx = int(parts[1])
+                fidx = int(parts[2])
+                group_key = (scene_i, pidx)
             except Exception:
                 continue
-            group = group_dict.setdefault(pidx, [])
+            group = group_dict.setdefault(group_key, [])
             group.append((fidx, fp))
 
-        for pidx, frames in group_dict.items():
+        for (scene_i, pidx), frames in group_dict.items():
             frames.sort(key=lambda x: x[0])
             if len(frames) < 2:
                 continue
 
-            out_path = os.path.join(output_dir, f"{pidx:04d}.rgb.mp4")
+            out_path = os.path.join(output_dir, f"{scene_i:04d}.{pidx:04d}.rgb.mp4")
             with imageio.get_writer(out_path, fps=float(video_fps)) as writer:
                 for _, frame_path in frames:
                     frame = iio.imread(frame_path)
@@ -165,83 +175,121 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
 
 
 def render_scene(
-    mesh_list, mesh_meta, envlight_path_list, shortname, prefix, FLAGS
+    mesh_list, mesh_meta, envlight_path_list, shortname, prefix, FLAGS, fixed_lighting=None, fixed_camera_params=None, scene_i=0, return_params=False, lgt_i=0
 ):
-    cam_radius = FLAGS.radius_range[0] + np.random.uniform() * (FLAGS.radius_range[1] - FLAGS.radius_range[0])
-
-    fovx = np.deg2rad(FLAGS.fov_range[0]+np.random.uniform()*(FLAGS.fov_range[1] - FLAGS.fov_range[0]))
-    fovx_list = None
-    azimuth = np.random.uniform(*FLAGS.cam_phi_range)
-    elevation = np.random.uniform(*FLAGS.cam_theta_range)
-    if FLAGS.cam_t_range is not None:
-        t = np.random.uniform(*FLAGS.cam_t_range, size=[3])
+    if scene_i > 0:
+        if fixed_lighting is None:
+            raise ValueError(f"fixed_lighting cannot be None when rendering scene variant {scene_i}")
+    if fixed_camera_params is not None:
+        cam_radius = fixed_camera_params.get('cam_radius')
+        fovx = fixed_camera_params.get('fovx')
+        fovx_list = fixed_camera_params.get('fovx_list')
+        t = fixed_camera_params.get('t', np.zeros(3))
+        azimuth_0 = fixed_camera_params.get('azimuth_0')
+        elevation_0 = fixed_camera_params.get('elevation_0')
+        azimuth_offset = fixed_camera_params.get('azimuth_offset')
+        elevation_offset = fixed_camera_params.get('elevation_offset')
+        elevation_values = fixed_camera_params.get('elevation_values')
+        env_rot_offset = fixed_camera_params.get('env_rot_offset')
+        obj_rot_offset = fixed_camera_params.get('obj_rot_offset')
+        mesh_id = fixed_camera_params.get('mesh_id')
+        drop_id = fixed_camera_params.get('drop_id')
+        drop_offset_list = fixed_camera_params.get('drop_offset_list')
+        cam_radius_list = fixed_camera_params.get('cam_radius_list')
+        azimuth = azimuth_0
+        elevation = elevation_0
     else:
-        t = np.zeros(3)
-    
-    cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, cam_radius)
+        cam_radius_list = None
+        cam_radius = FLAGS.radius_range[0] + np.random.uniform() * (FLAGS.radius_range[1] - FLAGS.radius_range[0])
+        fovx = np.deg2rad(FLAGS.fov_range[0]+np.random.uniform()*(FLAGS.fov_range[1] - FLAGS.fov_range[0]))
+        fovx_list = None
+        azimuth = np.random.uniform(*FLAGS.cam_phi_range)
+        elevation = np.random.uniform(*FLAGS.cam_theta_range)
+        elevation_values = None
+        if FLAGS.cam_t_range is not None:
+            t = np.random.uniform(*FLAGS.cam_t_range, size=[3])
+        else:
+            t = np.zeros(3)
 
     num_frames = FLAGS.num_frames
-    if FLAGS.video_mode == 'orbit_cam':
-        azimuth_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
-        elevation_offset = np.zeros(num_frames)
-    elif FLAGS.video_mode == 'oscil_cam':
-        phi_center = sum(FLAGS.cam_phi_range) / 2
-        phi_ratio = 0.6
-        phi_range = (FLAGS.cam_phi_range[1] - FLAGS.cam_phi_range[0]) / 2
-        phi_range_clip = phi_range * phi_ratio
-        azimuth = np.random.uniform(phi_center - phi_range_clip, phi_center + phi_range_clip)
-        cone_angle = np.random.uniform(0.2 * (1-phi_ratio) * phi_range, phi_range - np.abs(phi_center - azimuth))
-        # azimuth = np.random.uniform(*FLAGS.cam_phi_range)
-        azimuth_offset = np.sin(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
-        elevation_offset = np.cos(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
-    elif FLAGS.video_mode == 'dolly_cam':
-        # start_fov
-        fovx_fix = np.deg2rad(45)
-        radius_fix = 2.5
-        fovx_perturb = np.random.uniform(-10, 10, size=2)
-        fovx_motion = np.linspace(
-            max(10, FLAGS.fov_range[0] + fovx_perturb[0]),
-            FLAGS.fov_range[1] + fovx_perturb[1],
-            num_frames, endpoint=True
-        )
-        if random.random() < 0.5:
-            fovx_motion = fovx_motion[::-1]
-        fovx_list = []
-    elif FLAGS.video_mode == 'orbit_lgt':
-        env_rot_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
-    elif FLAGS.video_mode == 'rotat_obj':
-        obj_rot_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
-        mesh_id = [1]
-        if mesh_meta is not None and random.random() > 0.5:
-            if len(mesh_list) > 2 and 'metallic' not in mesh_meta[2]:
-                mesh_id.append(2)
-    elif FLAGS.video_mode == 'vtran_obj':
-        num_obj = len(mesh_list) - 1
-        drop_id = np.random.permutation(num_obj) + 1
-        drop_id = drop_id.tolist()
-        drop_id = drop_id[:1] if random.random() < 0.5 else drop_id[:2]
-        if 1 not in drop_id and random.random() < 0.8:
-            drop_id = drop_id + [1]
-        num_drop = len(drop_id)
-        drop_prev = [0] * num_drop
-        drop_range = [0.5, 1.5]
-        drop_list = np.random.uniform(*drop_range, size=[num_drop])
-        drop_offset_list = []
-        bounce = random.random() < 0.5 # always bounce 1/3 of the height
-        if bounce:
-            bounce_nframes = num_frames // 3 + random.randint(-num_frames//6, num_frames//6)
-        else:
-            bounce_nframes = 0
-        for drop in drop_list:
-            drop_offset = np.linspace(drop, 0, num_frames - bounce_nframes, endpoint=True) # the last is 0
+    if fixed_camera_params is None:
+        azimuth_offset = None
+        elevation_offset = None
+        fovx_motion = None
+        env_rot_offset = None
+        obj_rot_offset = None
+        mesh_id = None
+        drop_id = None
+        drop_offset_list = None
+        
+        if FLAGS.video_mode == 'orbit_cam':
+            azimuth_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
+            elevation_offset = np.zeros(num_frames)
+        elif FLAGS.video_mode == 'oscil_cam':
+            phi_center = sum(FLAGS.cam_phi_range) / 2
+            phi_ratio = 0.6
+            phi_range = (FLAGS.cam_phi_range[1] - FLAGS.cam_phi_range[0]) / 2
+            phi_range_clip = phi_range * phi_ratio
+            azimuth = np.random.uniform(phi_center - phi_range_clip, phi_center + phi_range_clip)
+            # azimuth = np.random.uniform(*FLAGS.cam_phi_range)
+            cone_angle = np.random.uniform(0.2 * (1-phi_ratio) * phi_range, phi_range - np.abs(phi_center - azimuth))
+            azimuth_offset = np.sin(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
+            elevation_offset = np.cos(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
+        elif FLAGS.video_mode == 'dolly_cam':
+            # start_fov
+            fovx_fix = np.deg2rad(45)
+            radius_fix = 2.5
+            fovx_perturb = np.random.uniform(-10, 10, size=2)
+            fovx_motion = np.linspace(
+                max(10, FLAGS.fov_range[0] + fovx_perturb[0]),
+                FLAGS.fov_range[1] + fovx_perturb[1],
+                num_frames, endpoint=True
+            )
+            if random.random() < 0.5:
+                fovx_motion = fovx_motion[::-1]
+            fovx_list = []
+            azimuth_offset = None
+            elevation_offset = None
+        elif FLAGS.video_mode == 'orbit_lgt':
+            env_rot_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
+            azimuth_offset = None
+            elevation_offset = None
+        elif FLAGS.video_mode == 'rotat_obj':
+            obj_rot_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
+            mesh_id = [1]
+            if mesh_meta is not None and random.random() > 0.5:
+                if len(mesh_list) > 2 and 'metallic' not in mesh_meta[2]:
+                    mesh_id.append(2)
+            azimuth_offset = None
+            elevation_offset = None
+        elif FLAGS.video_mode == 'vtran_obj':
+            num_obj = len(mesh_list) - 1
+            drop_id = np.random.permutation(num_obj) + 1
+            drop_id = drop_id.tolist()
+            drop_id = drop_id[:1] if random.random() < 0.5 else drop_id[:2]
+            if 1 not in drop_id and random.random() < 0.8:
+                drop_id = drop_id + [1]
+            num_drop = len(drop_id)
+            drop_prev = [0] * num_drop
+            drop_range = [0.5, 1.5]
+            drop_list = np.random.uniform(*drop_range, size=[num_drop])
+            drop_offset_list = []
+            bounce = random.random() < 0.5 # always bounce 1/3 of the height
             if bounce:
-                bounce_factor = random.uniform(0.33, 0.8)
-                bounce_offset = np.linspace(drop * bounce_factor, 0, bounce_nframes, endpoint=False)[::-1] # the last might not be 0
-                drop_offset = np.concatenate([drop_offset, bounce_offset])
-            drop_offset_list.append(drop_offset)
+                bounce_nframes = num_frames // 3 + random.randint(-num_frames//6, num_frames//6)
+            else:
+                bounce_nframes = 0
+            for drop in drop_list:
+                drop_offset = np.linspace(drop, 0, num_frames - bounce_nframes, endpoint=True) # the last is 0
+                if bounce:
+                    bounce_factor = random.uniform(0.33, 0.8)
+                    bounce_offset = np.linspace(drop * bounce_factor, 0, bounce_nframes, endpoint=False)[::-1]
+                    drop_offset = np.concatenate([drop_offset, bounce_offset])
+                drop_offset_list.append(drop_offset)
+            azimuth_offset = None
+            elevation_offset = None
 
-    cam_radius_list = None
-    if FLAGS.varying_radius:
+    if FLAGS.varying_radius and cam_radius_list is None:
         if random.random() < 0.3:
             # sin wave 
             # random roll
@@ -260,10 +308,11 @@ def render_scene(
     ori_shortname = shortname
     skip_features = False
     dump_format = FLAGS.dump_format # TODO:
-    for lgt_i in range(FLAGS.num_lighting):
-        prefix = f'{lgt_i:04d}.'
+    saved_params = None
+    if True:
+        prefix = f'{scene_i:04d}.{lgt_i:04d}.'
         if FLAGS.prefix_in_folder:
-            shortname = f'{ori_shortname}.{lgt_i:04d}'
+            shortname = f'{ori_shortname}.{scene_i:04d}.{lgt_i:04d}'
             prefix = ''
             os.makedirs(os.path.join(FLAGS.out_dir, shortname), exist_ok=True)
             
@@ -271,43 +320,65 @@ def render_scene(
         if FLAGS.analytical_sky:
             raise NotImplementedError('Not supported yet')
         else:
-            envlight_path = np.random.choice(envlight_path_list, p=FLAGS.envlight_sample_weight)
-        
-        envmap_strength = np.random.uniform(*FLAGS.random_env_scale) if FLAGS.random_env_scale is not None else FLAGS.env_scale
-        envmap_flip = False
-        if FLAGS.random_env_flip:
-            if random.random() > 0.5:
-                envmap_flip = True
-
-        if FLAGS.random_env_rotation:
-            envmap_rotation_y = random.uniform(0, 2*np.pi)
-        else:
-            envmap_rotation_y = 0
+            if fixed_lighting is not None:
+                envlight_path = fixed_lighting.get('envlight_path')
+                envmap_strength = fixed_lighting.get('envmap_strength', FLAGS.env_scale)
+                envmap_flip = fixed_lighting.get('envmap_flip', False)
+                envmap_rotation_y = fixed_lighting.get('envmap_rotation_y', 0)
+                if envlight_path is None:
+                    raise ValueError(f"fixed_lighting['envlight_path'] cannot be None when rendering scene variants")
+            else:
+                envlight_path = np.random.choice(envlight_path_list, p=FLAGS.envlight_sample_weight)
+                envmap_strength = np.random.uniform(*FLAGS.random_env_scale) if FLAGS.random_env_scale is not None else FLAGS.env_scale
+                envmap_flip = False
+                # Validate and retry if reading fails
+                max_retries = min(len(envlight_path_list), 5)
+                success = False
+                for retry in range(max_retries):
+                    success, _ = image_utils.read_img(envlight_path)
+                    if success:
+                        break
+                    else:
+                        envlight_path = np.random.choice(envlight_path_list, p=FLAGS.envlight_sample_weight)
+                if not success:
+                    raise ValueError(f"Could not find readable environment map after {max_retries} attempts")
+                if FLAGS.random_env_flip:
+                    if random.random() > 0.5:
+                        envmap_flip = True
+                if FLAGS.random_env_rotation:
+                    envmap_rotation_y = random.uniform(0, 2*np.pi)
+                else:
+                    envmap_rotation_y = 0
         envmap_rotation_y_0 = envmap_rotation_y
 
         if FLAGS.dump_envmap:
-            latlong_img = image_utils.read_img(envlight_path)
-            latlong_img = latlong_img * envmap_strength
-            latlong_img = np.nan_to_num(latlong_img, nan=0.0, posinf=65504.0, neginf=0.0) 
-            latlong_img = np.clip(latlong_img, 0.0, 65504.0)
-            latlong_img = torch.tensor(latlong_img, dtype=torch.float32)
-            if envmap_flip:
-                latlong_img = latlong_img.flip(1)
+            try:
+                success, latlong_img = image_utils.read_img(envlight_path)
+                if not success:
+                    raise IOError(f"Failed to read environment map {envlight_path}")
+                latlong_img = latlong_img * envmap_strength
+                latlong_img = np.nan_to_num(latlong_img, nan=0.0, posinf=65504.0, neginf=0.0) 
+                latlong_img = np.clip(latlong_img, 0.0, 65504.0)
+                latlong_img = torch.tensor(latlong_img, dtype=torch.float32)
+                if envmap_flip:
+                    latlong_img = latlong_img.flip(1)
 
-            # TODO: rotate
-            cubemap = render_utils.latlong_to_cubemap_torch(latlong_img, [512, 512])
-            env_proj = render_utils.cubemap_sample_torch(cubemap, -vec)
-            env_proj = env_proj.flip(0).flip(1)
+                # TODO: rotate
+                cubemap = render_utils.latlong_to_cubemap_torch(latlong_img, [512, 512])
+                env_proj = render_utils.cubemap_sample_torch(cubemap, -vec)
+                env_proj = env_proj.flip(0).flip(1)
 
-            env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
-            env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
-            image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_ldr.{dump_format}'), env_ev0)
-            image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_log.{dump_format}'), env_log)
-
-            if FLAGS.dump_env_bg:
-                intrinsic = render_utils.cam_intrinsics(fovx, FLAGS.resolution[1], FLAGS.resolution[0])
-                env_uv = render_utils.uv_mesh(FLAGS.resolution[1], FLAGS.resolution[0])
-                pos_cam = env_uv @ np.linalg.inv(intrinsic).T
+                env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
+                env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
+                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_ldr.{dump_format}'), env_ev0)
+                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_log.{dump_format}'), env_log)
+                if FLAGS.dump_env_bg:
+                    intrinsic = render_utils.cam_intrinsics(fovx, FLAGS.resolution[1], FLAGS.resolution[0])
+                    env_uv = render_utils.uv_mesh(FLAGS.resolution[1], FLAGS.resolution[0])
+                    pos_cam = env_uv @ np.linalg.inv(intrinsic).T
+            except Exception as e:
+                logger.warning(f"Failed to read environment map {envlight_path}: {e}. Skipping envmap dump for this lighting variant.")
+                cubemap = None
 
         blender_utils.set_envmap_texture(envlight_path, envmap_rotation_y, envmap_strength, envmap_flip)    
         logger.info(f"EnvProbe {lgt_i}/{FLAGS.num_lighting}: {envlight_path}")
@@ -343,11 +414,11 @@ def render_scene(
             elif FLAGS.video_mode == 'vtran_obj':
                 pass
             elif FLAGS.video_mode == 'dolly_cam':
-                fovx_frame = np.deg2rad(fovx_motion[it])
-                radius_frame = radius_fix * np.tan(fovx_fix/2) / np.tan(fovx_frame/2)
-                cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, radius_frame)
-                fovx_list.append(fovx_frame)
-
+                if fixed_camera_params is None:
+                    fovx_frame = np.deg2rad(fovx_motion[it])
+                    radius_frame = radius_fix * np.tan(fovx_fix/2) / np.tan(fovx_frame/2)
+                    cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, radius_frame)
+                    fovx_list.append(fovx_frame)
             if FLAGS.varying_radius and cam_radius_list is not None and FLAGS.video_mode != 'dolly_cam':
                 cam_radius = cam_radius_list[it]
                 cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, cam_radius)
@@ -364,8 +435,9 @@ def render_scene(
                 env_proj = env_proj.flip(0).flip(1)
                 env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
                 env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
-                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}{it:04d}.env_ldr.{dump_format}'), env_ev0)
-                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}{it:04d}.env_log.{dump_format}'), env_log)
+                frame_prefix = f'{scene_i:04d}.{lgt_i:04d}.{it:04d}'
+                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.env_ldr.{dump_format}'), env_ev0)
+                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.env_log.{dump_format}'), env_log)
 
                 if FLAGS.dump_ball_env:
                     vec_ball = -vec_ref.reshape(-1, 3) @ c2w[:3, :3].T
@@ -373,8 +445,8 @@ def render_scene(
                     env_proj = render_utils.cubemap_sample_torch(cubemap, -vec_query)[0]
                     env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
                     env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
-                    image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}{it:04d}.ball_env_ldr.{dump_format}'), env_ev0)
-                    image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}{it:04d}.ball_env_log.{dump_format}'), env_log)
+                    image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.ball_env_ldr.{dump_format}'), env_ev0)
+                    image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.ball_env_log.{dump_format}'), env_log)
 
                 if FLAGS.dump_env_bg:
                     bg_dir = pos_cam @ c2w[:3, :3].T
@@ -382,15 +454,14 @@ def render_scene(
                     bg_q_dir = -bg_dir.flip(1).contiguous().reshape(1, *FLAGS.resolution, 3)
                     bg_proj = render_utils.cubemap_sample_torch(cubemap, bg_q_dir)[0]
                     bg_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(bg_proj, max_point=16).clip(0, 1)).cpu().numpy()
-                    image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}{it:04d}.env_bg.{dump_format}'), bg_ev0)
-
-
+                    image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.env_bg.{dump_format}'), bg_ev0)
 
             meta_frame = {
                 # camera attributes
                 'transform_matrix': cam_matrix.tolist(), # standard blender c2w
                 'elevation': elevation,
                 'azimuth': azimuth,
+                'cam_radius': cam_radius,
                 # envmap
                 'envmap_rot': envmap_rotation_y,
                 'envmap_strength': envmap_strength,
@@ -400,7 +471,7 @@ def render_scene(
                 meta_frame['obj_rot'] = obj_rot_offset[it]
                 meta_frame['obj_rot_id'] = mesh_id
             if FLAGS.video_mode == 'vtran_obj':
-                meta_frame['drop_offset'] = [drop_offset_list[i][it] for i in range(num_drop)]
+                meta_frame['drop_offset'] = [drop_offset_list[i][it] for i in range(len(drop_id))]
                 meta_frame['drop_id'] = drop_id
             if FLAGS.video_mode == 'dolly_cam':
                 meta_frame['fov'] = fovx_frame
@@ -434,22 +505,65 @@ def render_scene(
 
         blender_passes = ['rgb']
         if not skip_features:
+            compositor_suffix = f'.{scene_i:04d}.{lgt_i:04d}'
             blender_utils.setup_render_passes(['normal', 'depth', 'diffcol', 'object', 'material'])
-            blender_utils.setup_compositor_nodes(output_dir=save_folder, 
-                passes=['normal', 'depth'], suffix=f'.{0:04d}') # NOTE: ['rgb', 'diffcol'] is removed here
-            blender_utils.render_albedo_and_material(output_dir=save_folder, passes=['albedo', 'orm'], suffix=f'.{0:04d}')
+            blender_utils.setup_compositor_nodes(output_dir=save_folder, passes=['normal', 'depth'], suffix=compositor_suffix)
+            blender_utils.render_albedo_and_material(output_dir=save_folder, passes=['albedo', 'orm'], suffix=compositor_suffix)
             blender_passes.extend(['normal', 'depth', 'albedo', 'orm'])
-        # else:
-        #     blender_utils.setup_compositor_nodes(output_dir=save_folder, passes=['rgb'], suffix=f'.{lgt_i:04d}')
-        blender_utils.render_all_frames(output_dir=save_folder, num_frames=num_frames, suffix=f'rgb.{lgt_i:04d}')
+        render_suffix = f'rgb.{scene_i:04d}.{lgt_i:04d}'
+        blender_utils.render_all_frames(output_dir=save_folder, num_frames=num_frames, suffix=render_suffix)
         
         # dump the meta data
         meta_dict['frames'] = meta_frames
         meta_dict['file_path'] = shortname
-        with open(os.path.join(FLAGS.out_dir, shortname, f'{prefix}meta.json'), 'w') as f:
+        meta_prefix = f'{scene_i:04d}.{lgt_i:04d}.'
+        with open(os.path.join(FLAGS.out_dir, shortname, f'{meta_prefix}meta.json'), 'w') as f:
             _meta_dict = copy.deepcopy(meta_dict)
             _meta_dict['mesh_list'] = mesh_meta
             json.dump(_meta_dict, f, indent=4)
+        
+        if return_params and lgt_i == 0:
+            actual_elevation_values = []
+            for frame in meta_frames:
+                actual_elevation_values.append(frame.get('elevation'))
+            
+            def safe_copy(value):
+                if value is None:
+                    return None
+                elif isinstance(value, np.ndarray):
+                    return value.copy()
+                elif isinstance(value, list):
+                    return value.copy()
+                else:
+                    return value
+            
+            saved_params = {
+                'camera': {
+                    'cam_radius': cam_radius,
+                    'fovx': fovx,
+                    'fovx_list': safe_copy(fovx_list),
+                    'azimuth_0': azimuth_0,
+                    'elevation_0': elevation_0,
+                    'azimuth_offset': safe_copy(azimuth_offset),
+                    'elevation_offset': safe_copy(elevation_offset),
+                    'elevation_values': np.array(actual_elevation_values) if actual_elevation_values else None,
+                    't': t.copy() if isinstance(t, np.ndarray) else np.array(t),
+                    'cam_radius_list': np.array(cam_radius_list).copy() if cam_radius_list is not None else None,
+                    'env_rot_offset': safe_copy(env_rot_offset),
+                    'obj_rot_offset': safe_copy(obj_rot_offset),
+                    'mesh_id': safe_copy(mesh_id),
+                    'drop_id': safe_copy(drop_id),
+                    'drop_offset_list': [safe_copy(d) for d in drop_offset_list] if drop_offset_list is not None else None,
+                },
+                'lighting': {
+                    'envlight_path': envlight_path,
+                    'envmap_strength': envmap_strength,
+                    'envmap_flip': envmap_flip,
+                    'envmap_rotation_y': envmap_rotation_y_0,
+                }
+            }
+    
+    return saved_params if return_params else None
 
 class GLTFFileManger:
     def __init__(
@@ -550,6 +664,7 @@ def main():
         'dump_features': False,
         'num_rendering': 10,
         'num_lighting': 1,
+        'num_scenes': 0,  # Number of scenes to render with fixed lighting (0 means disabled)
         'cam_phi_range': [0, 360],
         'cam_theta_range': [0, 90],
         'cam_t_range': [0, 0],
@@ -904,7 +1019,10 @@ def main():
         if FLAGS.num_frames > 1:
             prefix = f"{0:04d}."
         placement_grid = placement_grid * 0
-        blender_utils.clear_scene()
+        try:
+            blender_utils.clear_scene()
+        except Exception as e:
+            logger.warning(f"Error clearing scene before new iteration: {e}")
         mesh_list = []
         mesh_meta = []
 
@@ -974,7 +1092,162 @@ def main():
         else:
             render_fn = render_scene
 
-        render_fn(mesh_list, mesh_meta, envlight_path_list, name, prefix, FLAGS)
+        if render_fn == render_scene:
+            base_params = render_fn(mesh_list, mesh_meta, envlight_path_list, name, prefix, FLAGS, scene_i=0, return_params=True)
+        else:
+            render_fn(mesh_list, mesh_meta, envlight_path_list, name, prefix, FLAGS, scene_i=0)
+            base_params = None
+        
+        if FLAGS.num_lighting > 1 or FLAGS.num_scenes > 1:
+            if base_params is None:
+                logger.error("Base group parameters not returned, cannot generate variants")
+            else:
+                base_camera = base_params['camera']
+                base_lighting = base_params['lighting']
+                
+                fixed_camera_params = {
+                    'cam_radius': base_camera['cam_radius'],
+                    'fovx': base_camera['fovx'],
+                    'fovx_list': base_camera['fovx_list'],
+                    'azimuth_0': base_camera['azimuth_0'],
+                    'elevation_0': base_camera['elevation_0'],
+                    'azimuth_offset': base_camera['azimuth_offset'],
+                    'elevation_offset': base_camera['elevation_offset'],
+                    'elevation_values': base_camera['elevation_values'],
+                    't': base_camera['t'],
+                    'cam_radius_list': base_camera['cam_radius_list'],
+                    'env_rot_offset': base_camera['env_rot_offset'],
+                    'obj_rot_offset': base_camera['obj_rot_offset'],
+                    'mesh_id': base_camera['mesh_id'],
+                    'drop_id': base_camera['drop_id'],
+                    'drop_offset_list': base_camera['drop_offset_list'],
+                }
+                base_lighting_dict = {
+                    'envlight_path': base_lighting['envlight_path'],
+                    'envmap_strength': base_lighting['envmap_strength'],
+                    'envmap_flip': base_lighting['envmap_flip'],
+                    'envmap_rotation_y': base_lighting['envmap_rotation_y'],
+                }
+                if FLAGS.num_lighting > 1:
+                    for lgt_i in range(1, FLAGS.num_lighting):
+                        fixed_lighting = {
+                            'envlight_path': np.random.choice(envlight_path_list, p=FLAGS.envlight_sample_weight),
+                            'envmap_strength': np.random.uniform(*FLAGS.random_env_scale) if FLAGS.random_env_scale is not None else FLAGS.env_scale,
+                            'envmap_flip': random.random() > 0.5 if FLAGS.random_env_flip else False,
+                            'envmap_rotation_y': random.uniform(0, 2*np.pi) if FLAGS.random_env_rotation else 0
+                        }
+                        # Validate and retry if reading fails
+                        envlight_path = fixed_lighting['envlight_path']
+                        max_retries = min(len(envlight_path_list), 5)
+                        success = False
+                        for retry in range(max_retries):
+                            success, _ = image_utils.read_img(envlight_path)
+                            if success:
+                                break
+                            else:
+                                envlight_path = np.random.choice(envlight_path_list, p=FLAGS.envlight_sample_weight)
+                        if not success:
+                            raise ValueError(f"Could not find readable environment map after {max_retries} attempts for fixed_lighting")
+                        fixed_lighting['envlight_path'] = envlight_path
+                        render_fn(mesh_list, mesh_meta, envlight_path_list, name, prefix, FLAGS,
+                                 fixed_camera_params=fixed_camera_params, fixed_lighting=fixed_lighting, scene_i=0, lgt_i=lgt_i)
+                
+                if FLAGS.num_scenes > 1:
+                    for scene_idx in range(1, FLAGS.num_scenes):
+                        scene_i = scene_idx
+                        try:
+                            blender_utils.clear_scene()
+                        except Exception as e:
+                            logger.warning(f"Error clearing scene for scene variant {scene_i}: {e}")
+                        
+                        scene_mesh_list = []
+                        scene_mesh_meta = []
+                        placement_grid = placement_grid * 0
+                        if num_planes > 0:
+                            plane_idx = np.random.choice(num_planes, size=1, p=FLAGS.plane_sample_weight)[0]
+                            placement_plane = blender_utils.add_object_file(placement_plane_path[plane_idx], with_empty=True, recenter=True, rescale=True)
+                            placement_plane.apply_transform((0, 0, 0), scale=placement_plane_scale)
+                            plane_vmin, plane_vmax = placement_plane.aabb
+                            vz = plane_vmin[2]
+                            vplane = np.array(placement_plane_offset) - np.array([0, 0, vz])
+                            placement_plane.apply_transform(vplane)
+                            plane_meta = {'name': os.path.basename(placement_plane_path[plane_idx])}
+                            if num_plane_textures > 0:
+                                plane_tex_idx = np.random.choice(num_plane_textures, size=1, p=FLAGS.texture_sample_weight)[0]
+                                texture_scale = np.random.uniform(1.5, 2.5)
+                                placement_plane.apply_texture(plane_textures_path[plane_tex_idx], texture_scale)
+                                plane_meta['texture'] = plane_textures_path[plane_tex_idx]
+                                plane_meta['texture_scale'] = texture_scale
+                            scene_mesh_meta.append(plane_meta)
+                            scene_mesh_list.append(placement_plane)
+                        
+                        # Add new GLBs
+                        for j in range(FLAGS.glbs_per_scene):
+                            target = sample_glb(obj_iter, obj_idx=j)
+                            if target is not None:
+                                ref_mesh, meta = target
+                                scene_mesh_list.append(ref_mesh)
+                                scene_mesh_meta.append(meta)
+                        
+                        num_glbs = len(scene_mesh_list) - 1
+                        shape_list = []
+                        shape_meta = []
+                        for j in range(FLAGS.shapes_per_scene):
+                            target = sample_shape(baseshape_files, obj_idx=j+num_glbs)
+                            if target is not None:
+                                ref_mesh, meta = target
+                                shape_list.append(ref_mesh)
+                                if FLAGS.sample_shape_texture and num_plane_textures > 0:
+                                    if random.random() < 0.25:
+                                        plane_tex_idx = np.random.choice(num_plane_textures, size=1, p=FLAGS.texture_sample_weight)[0]
+                                        texture_scale = 1.0
+                                        ref_mesh.apply_texture(plane_textures_path[plane_tex_idx], texture_scale)
+                                        meta['texture'] = plane_textures_path[plane_tex_idx]
+                                        meta['texture_scale'] = texture_scale
+                                shape_meta.append(meta)
+                        
+                        if len(shape_list) > 0:
+                            scene_mesh_list.extend(shape_list)
+                            scene_mesh_meta.extend(shape_meta)
+                        
+                        scene_fixed_camera_params = fixed_camera_params.copy()
+                        if FLAGS.video_mode == 'rotat_obj':
+                            scene_fixed_camera_params['obj_rot_offset'] = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
+                            scene_fixed_camera_params['mesh_id'] = [1]
+                            if scene_mesh_meta is not None and random.random() > 0.5:
+                                if len(scene_mesh_list) > 2 and 'metallic' not in scene_mesh_meta[2]:
+                                    scene_fixed_camera_params['mesh_id'] = [1, 2]
+                        elif FLAGS.video_mode == 'vtran_obj':
+                            num_obj = len(scene_mesh_list) - 1
+                            drop_id = np.random.permutation(num_obj) + 1
+                            drop_id = drop_id.tolist()
+                            drop_id = drop_id[:1] if random.random() < 0.5 else drop_id[:2]
+                            if 1 not in drop_id and random.random() < 0.8:
+                                drop_id = drop_id + [1]
+                            num_drop = len(drop_id)
+                            drop_range = [0.5, 1.5]
+                            drop_list = np.random.uniform(*drop_range, size=[num_drop])
+                            drop_offset_list = []
+                            bounce = random.random() < 0.5
+                            if bounce:
+                                bounce_nframes = num_frames // 3 + random.randint(-num_frames//6, num_frames//6)
+                            else:
+                                bounce_nframes = 0
+                            for drop in drop_list:
+                                drop_offset = np.linspace(drop, 0, num_frames - bounce_nframes, endpoint=True)
+                                if bounce:
+                                    bounce_factor = random.uniform(0.33, 0.8)
+                                    bounce_offset = np.linspace(drop * bounce_factor, 0, bounce_nframes, endpoint=False)[::-1]
+                                    drop_offset = np.concatenate([drop_offset, bounce_offset])
+                                drop_offset_list.append(drop_offset)
+                            scene_fixed_camera_params['drop_id'] = drop_id
+                            scene_fixed_camera_params['drop_offset_list'] = drop_offset_list
+                        
+                        try:
+                            render_fn(scene_mesh_list, scene_mesh_meta, envlight_path_list, name, prefix, FLAGS,
+                                     fixed_camera_params=scene_fixed_camera_params, fixed_lighting=base_lighting_dict, scene_i=scene_i)
+                        except Exception as e:
+                            logger.error(f"Failed to render scene variant {scene_i}: {e}", exc_info=True)
 
         post_process_rendering(
             os.path.join(FLAGS.out_dir, name),
@@ -997,9 +1270,19 @@ def main():
             open(new_complete_file, 'w').close()
 
     # clean up and safely exit blender
-    blender_utils.clear_scene()
-    bpy.ops.wm.quit_blender()
-    # sys.exit(0)
+    # Note: Skip scene cleanup to avoid segfault on exit
+    # The OS will handle resource cleanup when the process terminates
+    try:
+        # Only clear frame handlers, skip object deletion to avoid segfault
+        bpy.app.handlers.frame_change_pre.clear()
+        bpy.app.handlers.frame_change_post.clear()
+    except Exception as e:
+        logger.warning(f"Error during handler cleanup: {e}")
+    
+    # Use os._exit() to avoid Python's cleanup process which can cause segfaults
+    # with Blender's internal resources. This immediately terminates the process.
+    logger.info("Rendering complete. Exiting...")
+    os._exit(0)
 
 if __name__ == "__main__":
     main()

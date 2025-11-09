@@ -10,13 +10,27 @@ import cv2
 
 
 def read_img(img_file):
-    if img_file.endswith('.exr'):
-        img = iio.imread(img_file, flags=cv2.IMREAD_UNCHANGED, plugin='opencv')
-    else:
-        img = iio.imread(img_file)
-    if img.ndim == 2:
-        img = img[..., None]
-    return img
+    try:
+        if img_file.endswith('.exr'):
+            img = iio.imread(img_file, flags=cv2.IMREAD_UNCHANGED, plugin='opencv')
+        elif img_file.endswith('.hdr'):
+            # Try imageio v3 first, fallback to v2 if needed
+            try:
+                img = iio.imread(img_file)
+            except Exception:
+                try:
+                    img = imageio.imread(img_file)  # Fallback to imageio v2
+                except Exception:
+                    return False, None
+        else:
+            img = iio.imread(img_file)
+        if img is None:
+            return False, None
+        if img.ndim == 2:
+            img = img[..., None]
+        return True, img
+    except Exception as e:
+        return False, None
 
 def save_image(fn, x : np.ndarray) -> np.ndarray:
     try:

@@ -383,31 +383,60 @@ def clear_scene():
         pass
 
     # Unhide all objects so they can be selected and deleted
-    for obj in bpy.data.objects:
-        obj.hide_set(False)
-        obj.hide_viewport = False
-        obj.hide_select = False
+    try:
+        for obj in bpy.data.objects:
+            try:
+                obj.hide_set(False)
+                obj.hide_viewport = False
+                obj.hide_select = False
+            except Exception:
+                pass
 
-    bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete(use_global=False, confirm=False)
-    
+        bpy.ops.object.select_all(action='SELECT')
+        bpy.ops.object.delete(use_global=False, confirm=False)
+    except Exception:
+        pass
 
-    # Clear orphaned data
-    for block in bpy.data.meshes:
-        if block.users == 0:
-            bpy.data.meshes.remove(block)
+    # Clear orphaned data with exception handling
+    try:
+        for block in list(bpy.data.meshes):
+            try:
+                if block.users == 0:
+                    bpy.data.meshes.remove(block)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    for block in bpy.data.materials:
-        if block.users == 0:
-            bpy.data.materials.remove(block)
+    try:
+        for block in list(bpy.data.materials):
+            try:
+                if block.users == 0:
+                    bpy.data.materials.remove(block)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    for block in bpy.data.textures:
-        if block.users == 0:
-            bpy.data.textures.remove(block)
+    try:
+        for block in list(bpy.data.textures):
+            try:
+                if block.users == 0:
+                    bpy.data.textures.remove(block)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    for block in bpy.data.images:
-        if block.users == 0:
-            bpy.data.images.remove(block)
+    try:
+        for block in list(bpy.data.images):
+            try:
+                if block.users == 0:
+                    bpy.data.images.remove(block)
+            except Exception:
+                pass
+    except Exception:
+        pass
     
 
 def add_object_file(object_path, with_empty=True, recenter=True, rescale=True):
@@ -478,14 +507,35 @@ def setup_realtime_camera_update(cam_pose, cam_mode='QUATERNION', fov_sequence=N
     # Get or create camera
     if 'Camera' in bpy.data.objects:
         camera = bpy.data.objects['Camera']
+        logger.debug(f"setup_realtime_camera_update: Found existing Camera: type={camera.type}, data={camera.data}")
+        # Check if it's actually a camera object with valid data
+        if camera.type != 'CAMERA' or camera.data is None:
+            logger.warning(f"setup_realtime_camera_update: Existing 'Camera' object is not a valid camera (type={camera.type}, data={camera.data}). Deleting and creating new camera...")
+            # Delete the invalid object
+            bpy.data.objects.remove(camera, do_unlink=True)
+            # Create a new camera
+            bpy.ops.object.camera_add()
+            camera = bpy.context.active_object
+            camera.name = 'Camera'
+            logger.debug(f"setup_realtime_camera_update: Created new Camera: type={camera.type}, data={camera.data}")
+        else:
+            logger.debug(f"setup_realtime_camera_update: Using existing valid Camera: type={camera.type}, data={camera.data}")
     else:
+        logger.debug("setup_realtime_camera_update: Creating new Camera...")
         bpy.ops.object.camera_add()
         camera = bpy.context.active_object
         camera.name = 'Camera'
+        logger.debug(f"setup_realtime_camera_update: Created Camera: type={camera.type}, data={camera.data}")
+    
+    # Final validation
+    if camera.data is None:
+        logger.error(f"setup_realtime_camera_update: ERROR - Camera has no data! type={camera.type}")
+        raise ValueError(f"Camera object has no data attribute. This should not happen.")
 
     # Set this camera as the active camera for the scene
     scene = bpy.context.scene
     scene.camera = camera
+    logger.debug(f"setup_realtime_camera_update: Set scene.camera. Final check: camera.type={camera.type}, camera.data={camera.data}")
 
     # Create camera animation with provided poses
     frame_count = len(cam_pose)
@@ -545,12 +595,29 @@ def setup_camera_settings(resolution_x=1920, resolution_y=1080, fov_rad=1.047, c
     # cam_type: 'PERSP', 'PANO'
     scene = bpy.context.scene
 
+    # Debug: Check camera state before accessing
+    logger.debug(f"setup_camera_settings called. Checking camera state...")
+    logger.debug(f"  scene.camera: {scene.camera}")
+    logger.debug(f"  'Camera' in bpy.data.objects: {'Camera' in bpy.data.objects}")
+    
+    if 'Camera' in bpy.data.objects:
+        camera_obj = bpy.data.objects['Camera']
+        logger.debug(f"  Camera object: name={camera_obj.name}, type={camera_obj.type}, data={camera_obj.data}")
+        if camera_obj.data is None:
+            logger.error(f"ERROR: Camera object exists but data is None!")
+            logger.error(f"  Object type: {camera_obj.type}")
+            logger.error(f"  Object name: {camera_obj.name}")
+            logger.error(f"  All objects in scene: {[(obj.name, obj.type, obj.data) for obj in bpy.data.objects]}")
+            raise ValueError(f"Camera object has no data attribute. setup_realtime_camera_update() should have created a valid camera.")
+    else:
+        logger.error(f"ERROR: Camera object does not exist in bpy.data.objects!")
+        logger.error(f"  All objects in scene: {[(obj.name, obj.type) for obj in bpy.data.objects]}")
+        raise ValueError("Camera object not found. setup_realtime_camera_update() should have created it.")
+
     # Ensure we have a camera set for rendering
     if scene.camera is None:
-        logger.info("Warning: No camera set for rendering. Attempting to find and set a camera.")
-        if 'Camera' in bpy.data.objects:
-            scene.camera = bpy.data.objects['Camera']
-            logger.info("Set 'Camera' as the active camera for rendering.")
+        logger.warning("Warning: No camera set for rendering. Setting 'Camera' as active camera.")
+        scene.camera = camera_obj
 
     # Set resolution
     scene.render.resolution_x = resolution_x
@@ -559,6 +626,11 @@ def setup_camera_settings(resolution_x=1920, resolution_y=1080, fov_rad=1.047, c
 
     camera_obj = bpy.data.objects['Camera']
     camera_data = camera_obj.data
+    if camera_data is None:
+        logger.error(f"FATAL: camera_obj.data is None after accessing!")
+        logger.error(f"  camera_obj.type: {camera_obj.type}")
+        logger.error(f"  camera_obj.name: {camera_obj.name}")
+        raise ValueError("Camera data is None - this should not happen if setup_realtime_camera_update() worked correctly")
     camera_data.clip_start = 0.02
 
     if cam_type == 'PERSP':
@@ -841,7 +913,11 @@ def set_envmap_texture(envmap_path, rotation=0., strength=1.0, flip=False, rot_o
 
     # Create new nodes
     env_texture = nodes.new(type='ShaderNodeTexEnvironment')
-    env_texture.image = bpy.data.images.load(envmap_path)
+    try:
+        env_texture.image = bpy.data.images.load(envmap_path)
+    except Exception as e:
+        logger.error(f"Failed to load environment map image {envmap_path}: {e}")
+        raise
     env_texture.location = (0, 0)
 
     background = nodes.new(type='ShaderNodeBackground')

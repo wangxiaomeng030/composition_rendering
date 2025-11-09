@@ -170,20 +170,23 @@ def run(mesh_list, mesh_meta, envlight_path_list, shortname, prefix, FLAGS):
         # Optional envmap dump (pass-level overview)
         cubemap = None
         if FLAGS.dump_envmap:
-            latlong_img = image_utils.read_img(envlight_path)
-            latlong_img = latlong_img * envmap_strength
-            latlong_img = np.nan_to_num(latlong_img, nan=0.0, posinf=65504.0, neginf=0.0)
-            latlong_img = np.clip(latlong_img, 0.0, 65504.0)
-            latlong_img = torch.tensor(latlong_img, dtype=torch.float32)
-            if envmap_flip:
-                latlong_img = latlong_img.flip(1)
-            cubemap = render_utils.latlong_to_cubemap_torch(latlong_img, [512, 512])
-            env_proj = render_utils.cubemap_sample_torch(cubemap, -vec)
-            env_proj = env_proj.flip(0).flip(1)
-            env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
-            env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
-            image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_ldr.{dump_format}'), env_ev0)
-            image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_log.{dump_format}'), env_log)
+            success, latlong_img = image_utils.read_img(envlight_path)
+            if success:
+                latlong_img = latlong_img * envmap_strength
+                latlong_img = np.nan_to_num(latlong_img, nan=0.0, posinf=65504.0, neginf=0.0)
+                latlong_img = np.clip(latlong_img, 0.0, 65504.0)
+                latlong_img = torch.tensor(latlong_img, dtype=torch.float32)
+                if envmap_flip:
+                    latlong_img = latlong_img.flip(1)
+                cubemap = render_utils.latlong_to_cubemap_torch(latlong_img, [512, 512])
+                env_proj = render_utils.cubemap_sample_torch(cubemap, -vec)
+                env_proj = env_proj.flip(0).flip(1)
+                env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
+                env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
+                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_ldr.{dump_format}'), env_ev0)
+                image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_log.{dump_format}'), env_log)
+            else:
+                logger.warning(f"Failed to read environment map {envlight_path}")
 
         # Set envmap in Blender for actual rendering
         blender_utils.set_envmap_texture(envlight_path, envmap_rotation_y, envmap_strength, envmap_flip)
