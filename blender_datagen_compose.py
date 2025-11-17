@@ -78,8 +78,12 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
         if p == 'normal' and len(img_list) > 0:
             meta_files = sorted(glob.glob(os.path.join(output_dir, f'*.meta.json')))
             if meta_files:
-                meta_file = json.load(open(meta_files[0]))
-            meta_frames = meta_file['frames']
+                with open(meta_files[0], 'r') as f:
+                    meta_file = json.load(f)
+                meta_frames = meta_file['frames']
+            else:
+                logger.warning(f"No meta.json files found for normal pass processing")
+                meta_frames = {}
         for img_path in img_list:
             img_basename = os.path.basename(img_path)
             img_name_part = img_basename.split('.')
@@ -90,11 +94,15 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
                 w_normal = image_utils.read_normal_exr(img_path)[..., :3] # [H, W, 3]
                 mask = (w_normal == 0).all(axis=-1, keepdims=True) # [H, W, 1]
                 bg_normal = np.array([0, 0, 1])
-                c2w = np.array(meta_frames[fidx]['transform_matrix'])
-                w2c_rot = np.linalg.inv(c2w[:3, :3])
-                s_normal = w_normal @ w2c_rot.T
-                s_normal = s_normal * (1-mask) + mask * bg_normal
-                s_normal = (s_normal + 1) * 0.5
+                if fidx in meta_frames and 'transform_matrix' in meta_frames[fidx]:
+                    c2w = np.array(meta_frames[fidx]['transform_matrix'])
+                    w2c_rot = np.linalg.inv(c2w[:3, :3])
+                    s_normal = w_normal @ w2c_rot.T
+                    s_normal = s_normal * (1-mask) + mask * bg_normal
+                    s_normal = (s_normal + 1) * 0.5
+                else:
+                    logger.error(f"No transform matrix found for frame {fidx}, using world normal")
+                    s_normal = (w_normal + 1) * 0.5
                 img_new_name = f'{scene_i:04d}.{pidx:04d}.{fidx:04d}.{p}.{feature_fmt}'
                 image_utils.save_image(os.path.join(output_dir, img_new_name), s_normal)
                 # remove the original normal
@@ -155,23 +163,32 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
                 continue
 
             out_path = os.path.join(output_dir, f"{scene_i:04d}.{pidx:04d}.rgb.mp4")
-            with imageio.get_writer(out_path, fps=float(video_fps)) as writer:
-                for _, frame_path in frames:
-                    frame = iio.imread(frame_path)
-                    if frame is None:
-                        continue
-                    # Convert float images to uint8
-                    if frame.dtype.kind == 'f':
-                        frame = np.clip(frame, 0.0, 1.0)
-                        frame = (frame * 255.0 + 0.5).astype(np.uint8)
-                    elif frame.dtype != np.uint8:
-                        # Best-effort cast
-                        frame = np.clip(frame, 0, 255).astype(np.uint8)
-                    # Ensure color (H,W,3)
-                    if frame.ndim == 2:
-                        frame = np.repeat(frame[..., None], 3, axis=-1)
-                    writer.append_data(frame)
-            logger.info(f"Wrote video: {out_path}")
+            try:
+                with imageio.get_writer(out_path, fps=float(video_fps)) as writer:
+                    for _, frame_path in frames:
+                        try:
+                            frame = iio.imread(frame_path)
+                            if frame is None:
+                                continue
+                            # Convert float images to uint8
+                            if frame.dtype.kind == 'f':
+                                frame = np.clip(frame, 0.0, 1.0)
+                                frame = (frame * 255.0 + 0.5).astype(np.uint8)
+                            elif frame.dtype != np.uint8:
+                                # Best-effort cast
+                                frame = np.clip(frame, 0, 255).astype(np.uint8)
+                            # Ensure color (H,W,3)
+                            if frame.ndim == 2:
+                                frame = np.repeat(frame[..., None], 3, axis=-1)
+                            writer.append_data(frame)
+                        except Exception as e:
+                            logger.warning(f"Failed to process frame {frame_path}: {e}")
+                            continue
+                logger.info(f"Wrote video: {out_path}")
+            except Exception as e:
+                logger.error(f"Failed to create video {out_path}: {e}", exc_info=True)
+                # Continue with next video instead of crashing
+                continue
 
 
 def render_scene(
@@ -419,6 +436,9 @@ def render_scene(
                     radius_frame = radius_fix * np.tan(fovx_fix/2) / np.tan(fovx_frame/2)
                     cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, radius_frame)
                     fovx_list.append(fovx_frame)
+            else:
+                cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, cam_radius)
+                
             if FLAGS.varying_radius and cam_radius_list is not None and FLAGS.video_mode != 'dolly_cam':
                 cam_radius = cam_radius_list[it]
                 cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, cam_radius)
@@ -1267,7 +1287,8 @@ def main():
             plt.close(fig)
         if FLAGS.dump_complete:
             new_complete_file = os.path.join(FLAGS.out_dir, f"COMPLETE_{name}")
-            open(new_complete_file, 'w').close()
+            with open(new_complete_file, 'w') as f:
+                pass  # Just create an empty file
 
     # clean up and safely exit blender
     # Note: Skip scene cleanup to avoid segfault on exit

@@ -1,34 +1,34 @@
-# Configuration file for using assets from /media/wxm/8dbeb4d4-8607-492e-981e-1309047cc361/codes_work/assets
+# Configuration file for using assets from /mnt/afs/wangxiaomeng/datasets/render_assets/
 # This config uses:
 # - HDRIs from assets/hdri/
 # - 3D models from assets/objaverse_lvis/
 # - PBR textures from assets/pbr/
 
 # 3D Model Assets
-base_path: /media/wxm/8dbeb4d4-8607-492e-981e-1309047cc361/codes_work/assets/objaverse_lvis
+base_path: /mnt/afs/wangxiaomeng/datasets/render_assets/objaverse_opp_36k
 baseshape_path: data/basicshapes  # Keep using existing basic shapes or set to None
 
 # Environment Maps (HDRI)
-envlight: /media/wxm/8dbeb4d4-8607-492e-981e-1309047cc361/codes_work/assets/hdri
+envlight: /mnt/afs/wangxiaomeng/datasets/render_assets/hdri
 env_scale: 1.0
 
 # Ground Plane (keep using existing or create new)
 placement_plane: data/plane_basic/plane.glb
 
 # PBR Textures for Ground Plane
-placement_plane_textures: /media/wxm/8dbeb4d4-8607-492e-981e-1309047cc361/codes_work/assets/pbr
+placement_plane_textures: /mnt/afs/wangxiaomeng/datasets/render_assets/pbr
 texture_sample_weight: null  # Optional: {"wood": 2.0, "brick": 1.5} to bias sampling
 
 # Rendering Settings
-num_frames: 8
-resolution: [512, 512]
-spp: 64
-use_denoise: OPTIX
+num_frames: 49
+resolution: [480, 832]
+spp: 128
+use_denoise: OPENIMAGEDENOISE
 bg_color: [0, 0, 0]
 dump_alpha: true
 dump_envmap: true
 dump_ball_env: true
-dump_env_bg: false
+dump_env_bg: true
 transparent_bg: true
 
 # Lighting Settings
@@ -39,7 +39,7 @@ random_env_scale: [0.7, 1.4]
 
 # Video Mode
 video_mode: orbit_cam
-num_rendering: 10
+num_rendering: 2000
 num_scenes: 2  # Number of scene variants to render with same layout (0 means disabled)
 
 # Camera Settings
@@ -75,4 +75,3 @@ dump_complete: false
 dump_blend: false
 dump_video: true
 dump_format: jpg
-

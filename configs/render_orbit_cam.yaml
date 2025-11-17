@@ -5,7 +5,7 @@ resolution: [512, 512]
 spp: 64
 envlight: data/envmaps
 env_scale: 1.0
-use_denoise: OPTIX
+use_denoise: OPENIMAGEDENOISE
 bg_color: [0, 0, 0]
 dump_alpha: true
 dump_envmap: true

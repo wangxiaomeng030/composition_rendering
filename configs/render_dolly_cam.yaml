@@ -1,35 +1,36 @@
-base_path: data/toy_objects/*/
+base_path: /mnt/afs/wangxiaomeng/datasets/render_assets/objaverse_opp_36k
 baseshape_path: data/basicshapes
-num_frames: 8
-resolution: [512, 512]
-spp: 64
-envlight: data/envmaps
+num_frames: 49
+resolution: [480, 832]
+spp: 128
+envlight: /mnt/afs/wangxiaomeng/datasets/render_assets/hdri
 env_scale: 1.0
-use_denoise: OPTIX
+use_denoise: OPENIMAGEDENOISE
 bg_color: [0, 0, 0]
 dump_alpha: true
 dump_envmap: true
 dump_ball_env: true
-dump_env_bg: false
+dump_env_bg: true
 transparent_bg: true
 num_lighting: 2
 random_env_rotation: true
 random_env_flip: true
 random_env_scale: [0.7, 1.4]
 video_mode: dolly_cam
-num_rendering: 2
+num_rendering: 2000
+num_scenes: 2
 cam_phi_range: [60, 120]
 cam_theta_range: [5, 50]
 cam_t_range: [-0.1, 0.1]
 fov_range: [15, 60]
 radius_range: [2.5, 3.5]
-glbs_per_scene: 2
+glbs_per_scene: 3
 glbs_scale_range: [1.0, 1.3]
 glbs_rotation_range: [-45, 45]
 glbs_placement_bbox: [-1.0, -1.0, 1.0, 1.0]
 glbs_rescale: true
 placement_plane: "data/plane_basic"
-placement_plane_textures: data/textures
+placement_plane_textures: /mnt/afs/wangxiaomeng/datasets/render_assets/pbr
 texture_sample_weight: null
 placement_bbox_scale: 1.1
 placement_plane_offset: [0, 0, -0.5]
@@ -41,6 +42,10 @@ shapes_scale_range: [0.3, 0.8]
 shapes_rotation_range: [0, 360]
 shapes_placement_bbox: [-1.5, -1.5, 1.5, 1.5]
 sample_shape_texture: true
+
+
+# Output Settings
 dump_complete: false
 dump_blend: false
-
+dump_video: true
+dump_format: jpg
