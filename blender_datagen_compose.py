@@ -762,12 +762,14 @@ def main():
     logger.info('\n' + OmegaConf.to_yaml(cfg))
     logger.info('---------')
 
+    # Always use time-based directory naming for uniqueness
+    # Format: YYYYMMDD_HHMMSS (e.g., 20241117_143025)
+    sub_folder = time.strftime("%Y%m%d_%H%M%S")
+    
     if FLAGS.seed is not None:
-        sub_folder = f"s{FLAGS.seed:06d}"         
         set_seed(FLAGS.seed)
     else:
         set_seed(None)
-        sub_folder = 's' + time.strftime("%m%d%H")
 
     sub_folder = f"{FLAGS.video_mode}_{sub_folder}"
     FLAGS.out_dir = os.path.join(FLAGS.out_dir, sub_folder)
