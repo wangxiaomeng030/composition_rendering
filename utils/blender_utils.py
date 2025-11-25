@@ -914,7 +914,10 @@ def set_envmap_texture(envmap_path, rotation=0., strength=1.0, flip=False, rot_o
     # Create new nodes
     env_texture = nodes.new(type='ShaderNodeTexEnvironment')
     try:
-        env_texture.image = bpy.data.images.load(envmap_path)
+        logger.info(f"Loading environment map: {envmap_path}")
+        # Use check_existing=True to reuse already-loaded images and avoid redundant I/O
+        env_texture.image = bpy.data.images.load(envmap_path, check_existing=True)
+        logger.info(f"Successfully loaded environment map: {envmap_path}")
     except Exception as e:
         logger.error(f"Failed to load environment map image {envmap_path}: {e}")
         raise

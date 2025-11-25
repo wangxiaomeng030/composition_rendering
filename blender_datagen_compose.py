@@ -73,17 +73,29 @@ def check_msh_bbox(msh):
 def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, video_fps=24):
     blender_passes = ['rgb', 'normal', 'depth', 'albedo', 'orm']
     mask = 0
+    
+    # Pre-load all meta.json files into a dictionary keyed by (scene_i, lgt_i)
+    meta_cache = {}
+    meta_files = sorted(glob.glob(os.path.join(output_dir, f'*.meta.json')))
+    for meta_file_path in meta_files:
+        try:
+            meta_basename = os.path.basename(meta_file_path)
+            # meta.json filename format: {scene_i:04d}.{lgt_i:04d}.meta.json
+            meta_name_parts = meta_basename.replace('.meta.json', '').split('.')
+            if len(meta_name_parts) >= 2:
+                meta_scene_i = int(meta_name_parts[0])
+                meta_lgt_i = int(meta_name_parts[1])
+                with open(meta_file_path, 'r') as f:
+                    meta_file = json.load(f)
+                meta_cache[(meta_scene_i, meta_lgt_i)] = meta_file.get('frames', {})
+        except Exception as e:
+            logger.warning(f"Failed to load meta.json file {meta_file_path}: {e}")
+    
+    if len(meta_files) > 0 and len(meta_cache) == 0:
+        logger.warning(f"Found {len(meta_files)} meta.json files but failed to load any of them")
+    
     for p in blender_passes:
         img_list = sorted(glob.glob(os.path.join(output_dir, f'{p}.*')))
-        if p == 'normal' and len(img_list) > 0:
-            meta_files = sorted(glob.glob(os.path.join(output_dir, f'*.meta.json')))
-            if meta_files:
-                with open(meta_files[0], 'r') as f:
-                    meta_file = json.load(f)
-                meta_frames = meta_file['frames']
-            else:
-                logger.warning(f"No meta.json files found for normal pass processing")
-                meta_frames = {}
         for img_path in img_list:
             img_basename = os.path.basename(img_path)
             img_name_part = img_basename.split('.')
@@ -94,6 +106,8 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
                 w_normal = image_utils.read_normal_exr(img_path)[..., :3] # [H, W, 3]
                 mask = (w_normal == 0).all(axis=-1, keepdims=True) # [H, W, 1]
                 bg_normal = np.array([0, 0, 1])
+                # Get the correct meta_frames for this scene_i and lgt_i (pidx)
+                meta_frames = meta_cache.get((scene_i, pidx), {})
                 if fidx in meta_frames and 'transform_matrix' in meta_frames[fidx]:
                     c2w = np.array(meta_frames[fidx]['transform_matrix'])
                     w2c_rot = np.linalg.inv(c2w[:3, :3])
@@ -101,7 +115,7 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
                     s_normal = s_normal * (1-mask) + mask * bg_normal
                     s_normal = (s_normal + 1) * 0.5
                 else:
-                    logger.error(f"No transform matrix found for frame {fidx}, using world normal")
+                    logger.warning(f"No transform matrix found for frame {fidx} in scene {scene_i} lighting {pidx} (meta key: ({scene_i}, {pidx})), using world normal")
                     s_normal = (w_normal + 1) * 0.5
                 img_new_name = f'{scene_i:04d}.{pidx:04d}.{fidx:04d}.{p}.{feature_fmt}'
                 image_utils.save_image(os.path.join(output_dir, img_new_name), s_normal)
@@ -384,8 +398,45 @@ def render_scene(
                 cubemap = render_utils.latlong_to_cubemap_torch(latlong_img, [512, 512])
                 env_proj = render_utils.cubemap_sample_torch(cubemap, -vec)
                 env_proj = env_proj.flip(0).flip(1)
-
-                env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
+                
+                # Proper HDR to LDR conversion with adaptive tone mapping
+                # Calculate luminance for proper tone mapping
+                lumi_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=env_proj.device, dtype=env_proj.dtype).view(1, 1, 3)
+                lumi = (env_proj * lumi_weights).sum(dim=-1, keepdim=True)  # [H, W, 1]
+                
+                # Adaptive exposure adjustment based on median luminance
+                # Move to CPU for median calculation to avoid potential GPU issues
+                try:
+                    lumi_flat = lumi.flatten()
+                    median_lumi = float(torch.median(lumi_flat.cpu()).item())
+                except Exception as e:
+                    # Fallback: use mean if median fails
+                    logger.warning(f"Median calculation failed, using mean: {e}")
+                    median_lumi = float(lumi.mean().item())
+                
+                if median_lumi > 0 and not np.isnan(median_lumi) and not np.isinf(median_lumi):
+                    # Target median luminance around 0.18 (middle gray)
+                    exposure_scale = 0.18 / median_lumi
+                    # Clamp exposure to reasonable range to avoid extreme adjustments
+                    exposure_scale = max(0.1, min(exposure_scale, 10.0))
+                    env_proj_exposed = env_proj * exposure_scale
+                else:
+                    env_proj_exposed = env_proj
+                    exposure_scale = 1.0
+                
+                # Apply Reinhard tone mapping with adaptive max_point
+                # max_point controls the white point - higher values preserve more highlights
+                env_max = float(env_proj_exposed.max().item())
+                if np.isnan(env_max) or np.isinf(env_max):
+                    env_max = 16.0  # Fallback default
+                # Adaptive max_point: use higher value for brighter images to preserve detail
+                adaptive_max_point = max(8.0, min(env_max * 0.3, 32.0))
+                
+                env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj_exposed, max_point=adaptive_max_point).clip(0, 1)).cpu().numpy()
+                
+                # Debug info for very bright images
+                if env_max > 50 or (exposure_scale < 0.5 or exposure_scale > 2.0):
+                    logger.debug(f"Env tone mapping: max={env_max:.2f}, median_lumi={median_lumi:.4f}, exposure={exposure_scale:.3f}, max_point={adaptive_max_point:.2f}")
                 env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
                 image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_ldr.{dump_format}'), env_ev0)
                 image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{prefix}env_log.{dump_format}'), env_log)
@@ -397,8 +448,9 @@ def render_scene(
                 logger.warning(f"Failed to read environment map {envlight_path}: {e}. Skipping envmap dump for this lighting variant.")
                 cubemap = None
 
-        blender_utils.set_envmap_texture(envlight_path, envmap_rotation_y, envmap_strength, envmap_flip)    
         logger.info(f"EnvProbe {lgt_i}/{FLAGS.num_lighting}: {envlight_path}")
+        blender_utils.set_envmap_texture(envlight_path, envmap_rotation_y, envmap_strength, envmap_flip)
+        logger.info(f"EnvProbe {lgt_i}/{FLAGS.num_lighting}: Environment map setup complete")
 
         meta_dict = {
             # 'tone_mapping': FLAGS.tonemap_type,
@@ -453,7 +505,23 @@ def render_scene(
                 vec_query = (vec_cam @ y_rot[:3, :3].T).reshape(1, *FLAGS.resolution, 3)
                 env_proj = render_utils.cubemap_sample_torch(cubemap, -vec_query)[0]
                 env_proj = env_proj.flip(0).flip(1)
-                env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
+                # Adaptive tone mapping for per-frame env projections
+                lumi_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=env_proj.device, dtype=env_proj.dtype).view(1, 1, 3)
+                lumi = (env_proj * lumi_weights).sum(dim=-1, keepdim=True)
+                try:
+                    median_lumi = float(torch.median(lumi.flatten().cpu()).item())
+                except Exception:
+                    median_lumi = float(lumi.mean().item())
+                if median_lumi > 0 and not np.isnan(median_lumi) and not np.isinf(median_lumi):
+                    exposure_scale = max(0.1, min(0.18 / median_lumi, 10.0))
+                    env_proj_exposed = env_proj * exposure_scale
+                else:
+                    env_proj_exposed = env_proj
+                env_max = float(env_proj_exposed.max().item())
+                if np.isnan(env_max) or np.isinf(env_max):
+                    env_max = 16.0
+                adaptive_max_point = max(8.0, min(env_max * 0.3, 32.0))
+                env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj_exposed, max_point=adaptive_max_point).clip(0, 1)).cpu().numpy()
                 env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
                 frame_prefix = f'{scene_i:04d}.{lgt_i:04d}.{it:04d}'
                 image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.env_ldr.{dump_format}'), env_ev0)
@@ -463,7 +531,23 @@ def render_scene(
                     vec_ball = -vec_ref.reshape(-1, 3) @ c2w[:3, :3].T
                     vec_query = (vec_ball @ y_rot[:3, :3].T).reshape(1, FLAGS.resolution[0], FLAGS.resolution[0], 3)
                     env_proj = render_utils.cubemap_sample_torch(cubemap, -vec_query)[0]
-                    env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj, max_point=16).clip(0, 1)).cpu().numpy()
+                    # Adaptive tone mapping for ball env
+                    lumi_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=env_proj.device, dtype=env_proj.dtype).view(1, 1, 3)
+                    lumi = (env_proj * lumi_weights).sum(dim=-1, keepdim=True)
+                    try:
+                        median_lumi = float(torch.median(lumi.flatten().cpu()).item())
+                    except Exception:
+                        median_lumi = float(lumi.mean().item())
+                    if median_lumi > 0 and not np.isnan(median_lumi) and not np.isinf(median_lumi):
+                        exposure_scale = max(0.1, min(0.18 / median_lumi, 10.0))
+                        env_proj_exposed = env_proj * exposure_scale
+                    else:
+                        env_proj_exposed = env_proj
+                    env_max = float(env_proj_exposed.max().item())
+                    if np.isnan(env_max) or np.isinf(env_max):
+                        env_max = 16.0
+                    adaptive_max_point = max(8.0, min(env_max * 0.3, 32.0))
+                    env_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(env_proj_exposed, max_point=adaptive_max_point).clip(0, 1)).cpu().numpy()
                     env_log = render_utils.rgb_to_srgb(torch.log1p(env_proj) / np.log1p(10000)).clip(0, 1).cpu().numpy()
                     image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.ball_env_ldr.{dump_format}'), env_ev0)
                     image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.ball_env_log.{dump_format}'), env_log)
@@ -473,7 +557,23 @@ def render_scene(
                     bg_dir = (bg_dir @ y_rot[:3, :3].T)
                     bg_q_dir = -bg_dir.flip(1).contiguous().reshape(1, *FLAGS.resolution, 3)
                     bg_proj = render_utils.cubemap_sample_torch(cubemap, bg_q_dir)[0]
-                    bg_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(bg_proj, max_point=16).clip(0, 1)).cpu().numpy()
+                    # Adaptive tone mapping for env background
+                    lumi_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=bg_proj.device, dtype=bg_proj.dtype).view(1, 1, 3)
+                    lumi = (bg_proj * lumi_weights).sum(dim=-1, keepdim=True)
+                    try:
+                        median_lumi = float(torch.median(lumi.flatten().cpu()).item())
+                    except Exception:
+                        median_lumi = float(lumi.mean().item())
+                    if median_lumi > 0 and not np.isnan(median_lumi) and not np.isinf(median_lumi):
+                        exposure_scale = max(0.1, min(0.18 / median_lumi, 10.0))
+                        bg_proj_exposed = bg_proj * exposure_scale
+                    else:
+                        bg_proj_exposed = bg_proj
+                    bg_max = float(bg_proj_exposed.max().item())
+                    if np.isnan(bg_max) or np.isinf(bg_max):
+                        bg_max = 16.0
+                    adaptive_max_point = max(8.0, min(bg_max * 0.3, 32.0))
+                    bg_ev0 = render_utils.rgb_to_srgb(render_utils.reinhard(bg_proj_exposed, max_point=adaptive_max_point).clip(0, 1)).cpu().numpy()
                     image_utils.save_image(os.path.join(FLAGS.out_dir, f'{shortname}/{frame_prefix}.env_bg.{dump_format}'), bg_ev0)
 
             meta_frame = {
@@ -790,8 +890,14 @@ def main():
 
     placement_vmin, placement_vmax = np.array(FLAGS.placement_bbox[:2]), np.array(FLAGS.placement_bbox[2:])
     placement_range = placement_vmax - placement_vmin
+    # Validate placement_range to avoid division by zero or invalid values
+    if np.any(placement_range <= 0) or np.any(np.isnan(placement_range)) or np.any(np.isinf(placement_range)):
+        raise ValueError(f"Invalid placement_range: {placement_range}. Check placement_bbox configuration.")
     placement_grid = np.zeros(FLAGS.placement_grid_res, dtype=np.int32)
     placement_bbox2grid = np.array(FLAGS.placement_grid_res) / placement_range
+    # Validate placement_bbox2grid
+    if np.any(np.isnan(placement_bbox2grid)) or np.any(np.isinf(placement_bbox2grid)):
+        raise ValueError(f"Invalid placement_bbox2grid: {placement_bbox2grid}. Check placement_bbox and placement_grid_res configuration.")
     placement_plane_offset = np.array(FLAGS.placement_plane_offset, dtype=np.float32)
     placement_plane_scale = np.array(FLAGS.placement_plane_scale, dtype=np.float32)
     placement_plane_path = FLAGS.placement_plane
@@ -835,11 +941,37 @@ def main():
         mesh_center = np.array((vmax + vmin) * 0.5)
         cz = (mesh_center[2] - vmin[2])
         mesh_bounds = np.array(vmax - vmin)[:2]
+        
+        # Validate mesh_bounds to avoid invalid values
+        if np.any(np.isnan(mesh_bounds)) or np.any(np.isinf(mesh_bounds)) or np.any(mesh_bounds <= 0):
+            logger.info(f'Mesh {mesh_name} has invalid bounds: {mesh_bounds}, skipping')
+            ref_mesh.clear_objects()
+            del ref_mesh
+            return None
+        
         if FLAGS.video_mode == 'rotat_obj':
             # use square bbox
             mesh_bounds[:] = np.max(mesh_bounds)
         mesh_gbounds = mesh_bounds * placement_bbox2grid
+        
+        # Validate mesh_gbounds and clamp to reasonable values to avoid overflow
+        if np.any(np.isnan(mesh_gbounds)) or np.any(np.isinf(mesh_gbounds)):
+            logger.info(f'Mesh {mesh_name} has invalid grid bounds: {mesh_gbounds}, skipping')
+            ref_mesh.clear_objects()
+            del ref_mesh
+            return None
+        
+        # Clamp to reasonable maximum to avoid overflow when converting to int
+        max_grid_size = min(FLAGS.placement_grid_res)
+        mesh_gbounds = np.clip(mesh_gbounds, 0, max_grid_size)
         bx, by = int(np.ceil(mesh_gbounds[0] * bbox_scale)), int(np.ceil(mesh_gbounds[1] * bbox_scale))
+        
+        # Final validation of bx, by
+        if bx <= 0 or by <= 0 or bx > max_grid_size or by > max_grid_size:
+            logger.info(f'Mesh {mesh_name} has invalid grid dimensions: bx={bx}, by={by}, skipping')
+            ref_mesh.clear_objects()
+            del ref_mesh
+            return None
         
         mesh_placement_vmin =  glbs_placement_vmin + mesh_bounds * 0.5
         mesh_placement_vmax =  glbs_placement_vmax - mesh_bounds * 0.5
@@ -902,8 +1034,34 @@ def main():
         mesh_center = np.array((vmax + vmin) * 0.5)
         cz = (mesh_center[2] - vmin[2])
         mesh_bounds = np.array(vmax - vmin)[:2]
+        
+        # Validate mesh_bounds to avoid invalid values
+        if np.any(np.isnan(mesh_bounds)) or np.any(np.isinf(mesh_bounds)) or np.any(mesh_bounds <= 0):
+            logger.info(f'Shape mesh {mesh_name} has invalid bounds: {mesh_bounds}, skipping')
+            ref_mesh.clear_objects()
+            del ref_mesh
+            return None
+        
         mesh_gbounds = mesh_bounds * placement_bbox2grid
+        
+        # Validate mesh_gbounds and clamp to reasonable values to avoid overflow
+        if np.any(np.isnan(mesh_gbounds)) or np.any(np.isinf(mesh_gbounds)):
+            logger.info(f'Shape mesh {mesh_name} has invalid grid bounds: {mesh_gbounds}, skipping')
+            ref_mesh.clear_objects()
+            del ref_mesh
+            return None
+        
+        # Clamp to reasonable maximum to avoid overflow when converting to int
+        max_grid_size = min(FLAGS.placement_grid_res)
+        mesh_gbounds = np.clip(mesh_gbounds, 0, max_grid_size)
         bx, by = int(np.ceil(mesh_gbounds[0] * bbox_scale)), int(np.ceil(mesh_gbounds[1] * bbox_scale))
+        
+        # Final validation of bx, by
+        if bx <= 0 or by <= 0 or bx > max_grid_size or by > max_grid_size:
+            logger.info(f'Shape mesh {mesh_name} has invalid grid dimensions: bx={bx}, by={by}, skipping')
+            ref_mesh.clear_objects()
+            del ref_mesh
+            return None
         mesh_placement_vmin =  shapes_placement_vmin + mesh_bounds * 0.5
         mesh_placement_vmax =  shapes_placement_vmax - mesh_bounds * 0.5
 
